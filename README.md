@@ -4,16 +4,17 @@ A container image for [kagi-cli](https://github.com/Microck/kagi-cli) that runs
 as a [Model Context Protocol](https://modelcontextprotocol.io/) (MCP) server
 over stdio (default) or Streamable HTTP.
 
-This build is **session-token-only**. MCP tools that require a Kagi API key
-(`KAGI_API_KEY`) or the legacy API token (`KAGI_API_TOKEN`) are removed from the
-tool catalog at build time, so MCP clients never discover them. See
-[Session-token-only build](#session-token-only-build).
+The image ships kagi-cli's full MCP tool catalog. If you authenticate with a
+session token, the tools that require a Kagi API key (`KAGI_API_KEY`) or the
+legacy API token (`KAGI_API_TOKEN`) cannot work; hide them at runtime with
+`--exclude-tools` or `KAGI_MCP_TOOLS`. See
+[Choosing which tools to expose](#choosing-which-tools-to-expose).
 
 ## Image
 
 ```
 ghcr.io/mjtimblin/kagi-cli:latest
-ghcr.io/mjtimblin/kagi-cli:<kagi-cli version>   # e.g. 0.20.1
+ghcr.io/mjtimblin/kagi-cli:<kagi-cli version>   # e.g. 0.22.0
 ```
 
 ## Build locally
@@ -25,7 +26,7 @@ docker build -t kagi-cli .
 Pin a different upstream kagi-cli version:
 
 ```bash
-docker build --build-arg KAGI_VERSION=0.20.1 -t kagi-cli .
+docker build --build-arg KAGI_VERSION=0.22.0 -t kagi-cli .
 ```
 
 The image `ENTRYPOINT` is `kagi`, so `docker run kagi-cli mcp` runs
@@ -134,6 +135,9 @@ Add a server under `mcp.servers`. Because the volume is a named volume, the
 }
 ```
 
+To apply a tool filter, append `--exclude-tools ...` (or `--tools ...`) to the
+`command` array. See [Choosing which tools to expose](#choosing-which-tools-to-expose).
+
 ### Remote (HTTP transport)
 
 Start the container in HTTP mode as shown in
@@ -183,11 +187,18 @@ If you prefer not to seed a volume, pass the token through the environment.
 
 Set `KAGI_SESSION_TOKEN` in the shell that launches OpenCode.
 
-## Session-token-only build
+## Choosing which tools to expose
 
-`patches/session-token-only.patch` is applied to `src/main.rs` during the image
-build. It filters the MCP tool catalog and trims the discovery instructions so
-the following tools are neither listed nor callable:
+kagi-cli [0.22.0](https://github.com/Microck/kagi-cli/releases/tag/v0.22.0)
+filters the MCP tool catalog at startup, so this image no longer patches the
+source to hide tools. Pass `--exclude-tools` to drop tools, `--tools` to
+allowlist them, or set `KAGI_MCP_TOOLS` to an environment allowlist. Hidden tools
+are also rejected when called, not just omitted from `tools/list`.
+
+### Session-token-only
+
+If you authenticate with a session token, exclude the tools that need a Kagi API
+key or the legacy API token:
 
 | Tool | Required credential |
 | --- | --- |
@@ -197,15 +208,37 @@ the following tools are neither listed nor callable:
 | `kagi_enrich_news` | `KAGI_API_TOKEN` |
 | `kagi_summarize` | `KAGI_API_TOKEN` (default path) |
 
-Calls to a removed tool are rejected with `Unknown tool`, because the call
-validator uses the same filtered catalog.
+Pass them to `kagi mcp`:
 
-> **Version pinning:** the patches are written against a specific kagi-cli
-> release (currently `0.20.1`). They contain context lines from the upstream
-> sources, so they may need to be regenerated when `KAGI_VERSION` changes. The
-> publish workflow builds with the new version and will fail loudly at the
-> `git apply` step if a patch no longer applies — that is the signal to update
-> the patch.
+```bash
+docker run --rm -i \
+  -v kagi-config:/root/.config/kagi-cli:ro \
+  kagi-cli mcp \
+  --exclude-tools kagi_extract,kagi_fastgpt,kagi_enrich_web,kagi_enrich_news,kagi_summarize
+```
+
+Or set `KAGI_MCP_TOOLS` to the tools you *do* want, which is useful when passing
+arguments is awkward. For example, expose a core read-only catalog:
+
+```bash
+docker run --rm -i -e KAGI_MCP_TOOLS \
+  -v kagi-config:/root/.config/kagi-cli:ro \
+  kagi-cli mcp
+```
+
+```bash
+KAGI_MCP_TOOLS=kagi_search,kagi_batch_search,kagi_quick kagi-cli mcp
+```
+
+`--tools` and `--exclude-tools` cannot be combined; either flag overrides
+`KAGI_MCP_TOOLS`. Names are case-sensitive, surrounding whitespace is trimmed,
+and duplicates are ignored. Unknown or empty names abort startup. Mutating tools
+still require `--enable-mutating-tools`; an allowlist alone does not enable them.
+
+> **Tool names can change between kagi-cli releases.** Run `kagi mcp` and call
+> `tools/list`, or check the upstream
+> [MCP docs](https://github.com/Microck/kagi-cli/blob/main/docs/content/docs/commands/mcp.mdx),
+> to confirm the names for your pinned `KAGI_VERSION`.
 
 ## HTTP transport build
 
@@ -214,6 +247,12 @@ flags to `kagi mcp`. It factors the per-message JSON-RPC handling out of the
 stdio loop (`mcp_handle_request`) so both transports share it, and serves the
 Streamable HTTP transport with `axum`. See
 [Run as an HTTP MCP server](#run-as-an-http-mcp-server).
+
+> **Version pinning:** the patch is written against a specific kagi-cli release
+> (currently `0.22.0`). It contains context lines from the upstream sources, so
+> it may need to be regenerated when `KAGI_VERSION` changes. The publish workflow
+> builds with the new version and will fail loudly at the `git apply` step if the
+> patch no longer applies — that is the signal to update the patch.
 
 ## Publishing
 

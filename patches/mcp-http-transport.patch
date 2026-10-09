@@ -1,6 +1,6 @@
 Subject: [PATCH] mcp: add Streamable HTTP transport
 
-Targets Microck/kagi-cli v0.20.1 (src/cli.rs, src/main.rs, Cargo.toml).
+Targets Microck/kagi-cli v0.22.0 (src/cli.rs, src/main.rs, Cargo.toml).
 
 Add a native HTTP transport to `kagi mcp` alongside the default stdio
 transport, selectable with:
@@ -18,7 +18,7 @@ Adds the `axum` dependency (http1/json/tokio features only) and enables tokio's
 
 ---
 diff --git a/Cargo.toml b/Cargo.toml
-index e308397..d05145f 100644
+index 5b044ba..cae0411 100644
 --- a/Cargo.toml
 +++ b/Cargo.toml
 @@ -23,6 +23,7 @@ exclude = [
@@ -39,7 +39,7 @@ index e308397..d05145f 100644
  tracing = "0.1.41"
  tracing-subscriber = { version = "0.3.19", features = ["env-filter"] }
 diff --git a/src/cli.rs b/src/cli.rs
-index 7471381..55413bd 100644
+index d73fbfd..4458f98 100644
 --- a/src/cli.rs
 +++ b/src/cli.rs
 @@ -1430,6 +1430,15 @@ pub struct WatchArgs {
@@ -58,7 +58,7 @@ index 7471381..55413bd 100644
  #[derive(Debug, Args)]
  /// Arguments for the `mcp` subcommand.
  pub struct McpArgs {
-@@ -1447,6 +1456,18 @@ pub struct McpArgs {
+@@ -1465,6 +1474,18 @@ pub struct McpArgs {
      /// Expose MCP tools that mutate Kagi account or local CLI state
      #[arg(long)]
      pub enable_mutating_tools: bool,
@@ -78,7 +78,7 @@ index 7471381..55413bd 100644
  
  #[derive(Debug, Clone, Subcommand)]
 diff --git a/src/main.rs b/src/main.rs
-index 1f0b626..015ff94 100644
+index 7e25b6c..a7a07d5 100644
 --- a/src/main.rs
 +++ b/src/main.rs
 @@ -47,10 +47,10 @@ use crate::cli::{
@@ -96,10 +96,10 @@ index 1f0b626..015ff94 100644
  };
  use crate::error::KagiError;
  use crate::quick::{execute_quick, format_quick_markdown, format_quick_pretty};
-@@ -3242,6 +3242,14 @@ impl McpServerConfig {
- async fn run_mcp(args: McpArgs, profile: Option<&str>) -> Result<(), KagiError> {
-     let _json_lines = args.json_lines;
-     let config = McpServerConfig::new(args.default_output, args.enable_mutating_tools);
+@@ -3332,6 +3332,14 @@ async fn run_mcp(args: McpArgs, profile: Option<&str>) -> Result<(), KagiError>
+             tools.as_deref(),
+             args.exclude_tools.as_deref().unwrap_or_default(),
+         )?;
 +    match args.transport {
 +        McpTransport::Stdio => run_mcp_stdio(profile, config).await,
 +        McpTransport::Http => run_mcp_http(&args.host, args.port, profile, config).await,
@@ -111,7 +111,7 @@ index 1f0b626..015ff94 100644
      let stdin = io::stdin();
      for line in stdin.lock().lines() {
          let line =
-@@ -3257,68 +3265,172 @@ async fn run_mcp(args: McpArgs, profile: Option<&str>) -> Result<(), KagiError>
+@@ -3347,68 +3355,172 @@ async fn run_mcp(args: McpArgs, profile: Option<&str>) -> Result<(), KagiError>
                  continue;
              }
          };
