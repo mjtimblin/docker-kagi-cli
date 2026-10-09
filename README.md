@@ -2,7 +2,7 @@
 
 A container image for [kagi-cli](https://github.com/Microck/kagi-cli) that runs
 as a [Model Context Protocol](https://modelcontextprotocol.io/) (MCP) server
-over stdio.
+over stdio (default) or Streamable HTTP.
 
 This build is **session-token-only**. MCP tools that require a Kagi API key
 (`KAGI_API_KEY`) or the legacy API token (`KAGI_API_TOKEN`) are removed from the
@@ -87,6 +87,29 @@ docker run --rm -i \
 
 The second volume persists search history and cached responses.
 
+## Run as an HTTP MCP server
+
+Pass `--transport http` to serve the MCP Streamable HTTP transport instead of
+stdio, and choose the bind address with `--host` (default `127.0.0.1`) and the
+port with `--port` (default `8080`):
+
+```bash
+docker run --rm \
+  -p 127.0.0.1:8080:8080 \
+  -v kagi-config:/root/.config/kagi-cli:ro \
+  -v kagi-cache:/root/.cache/kagi-cli \
+  kagi-cli mcp --transport http --host 0.0.0.0 --port 8080
+```
+
+MCP clients send requests to `http://<host>:<port>/mcp`. Any path is accepted;
+`/mcp` is the conventional endpoint. Inside the container the server must bind
+`0.0.0.0` (not the default `127.0.0.1`) for the published port to be reachable
+from the host.
+
+The HTTP transport has no authentication of its own and is stateless, so more
+than one client can share one instance. Only publish the port on a trusted
+interface; `-p 127.0.0.1:8080:8080` keeps it on the local host.
+
 ## OpenCode MCP config
 
 Add a server under `mcp.servers`. Because the volume is a named volume, the
@@ -105,6 +128,26 @@ Add a server under `mcp.servers`. Because the volume is a named volume, the
           "-v", "kagi-cache:/root/.cache/kagi-cli",
           "kagi-cli", "mcp"
         ]
+      }
+    }
+  }
+}
+```
+
+### Remote (HTTP transport)
+
+Start the container in HTTP mode as shown in
+[Run as an HTTP MCP server](#run-as-an-http-mcp-server), then point OpenCode at
+its URL. No volume is referenced from OpenCode itself:
+
+```jsonc title="opencode.jsonc"
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "servers": {
+      "kagi": {
+        "type": "remote",
+        "url": "http://127.0.0.1:8080/mcp"
       }
     }
   }
@@ -157,11 +200,20 @@ the following tools are neither listed nor callable:
 Calls to a removed tool are rejected with `Unknown tool`, because the call
 validator uses the same filtered catalog.
 
-> **Version pinning:** the patch is written against a specific kagi-cli release
-> (currently `0.20.1`). It contains context lines from `src/main.rs`, so it may
-> need to be regenerated when `KAGI_VERSION` changes. The publish workflow builds
-> with the new version and will fail loudly at the `git apply` step if the patch
-> no longer applies — that is the signal to update the patch.
+> **Version pinning:** the patches are written against a specific kagi-cli
+> release (currently `0.20.1`). They contain context lines from the upstream
+> sources, so they may need to be regenerated when `KAGI_VERSION` changes. The
+> publish workflow builds with the new version and will fail loudly at the
+> `git apply` step if a patch no longer applies — that is the signal to update
+> the patch.
+
+## HTTP transport build
+
+`patches/mcp-http-transport.patch` adds the `--transport`, `--host`, and `--port`
+flags to `kagi mcp`. It factors the per-message JSON-RPC handling out of the
+stdio loop (`mcp_handle_request`) so both transports share it, and serves the
+Streamable HTTP transport with `axum`. See
+[Run as an HTTP MCP server](#run-as-an-http-mcp-server).
 
 ## Publishing
 

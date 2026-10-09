@@ -1,0 +1,341 @@
+Subject: [PATCH] mcp: add Streamable HTTP transport
+
+Targets Microck/kagi-cli v0.20.1 (src/cli.rs, src/main.rs, Cargo.toml).
+
+Add a native HTTP transport to `kagi mcp` alongside the default stdio
+transport, selectable with:
+
+    kagi mcp --transport http --host <host> --port <port>
+
+This serves the MCP Streamable HTTP transport: every POST body is handled as a
+single JSON-RPC message (or a batch), requests return JSON, and notifications
+return an empty 202 Accepted. The stdio path is unchanged in behavior; the
+per-message handling logic is factored into mcp_handle_request so both
+transports share it.
+
+Adds the `axum` dependency (http1/json/tokio features only) and enables tokio's
+`net` feature.
+
+---
+diff --git a/Cargo.toml b/Cargo.toml
+index e308397..d05145f 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -23,6 +23,7 @@ exclude = [
+ ]
+ 
+ [dependencies]
++axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
+ clap = { version = "4.6.6", features = ["derive"] }
+ clap_complete = "4.6.9"
+ cliclack = "0.5.6"
+@@ -36,7 +37,7 @@ scraper = "0.27.0"
+ serde = { version = "1.0.228", features = ["derive"] }
+ serde_json = "1.0.151"
+ thiserror = "2.0.20"
+-tokio = { version = "1.52.3", features = ["macros", "rt-multi-thread", "time"] }
++tokio = { version = "1.52.3", features = ["macros", "net", "rt-multi-thread", "time"] }
+ toml = "1.1.4"
+ tracing = "0.1.41"
+ tracing-subscriber = { version = "0.3.19", features = ["env-filter"] }
+diff --git a/src/cli.rs b/src/cli.rs
+index 7471381..55413bd 100644
+--- a/src/cli.rs
++++ b/src/cli.rs
+@@ -1430,6 +1430,15 @@ pub struct WatchArgs {
+     pub format: OutputFormat,
+ }
+ 
++#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
++/// Transport the native Kagi MCP server listens on.
++pub enum McpTransport {
++    /// Serve JSON-RPC over stdin/stdout (default).
++    Stdio,
++    /// Serve the MCP Streamable HTTP transport on the configured host and port.
++    Http,
++}
++
+ #[derive(Debug, Args)]
+ /// Arguments for the `mcp` subcommand.
+ pub struct McpArgs {
+@@ -1447,6 +1456,18 @@ pub struct McpArgs {
+     /// Expose MCP tools that mutate Kagi account or local CLI state
+     #[arg(long)]
+     pub enable_mutating_tools: bool,
++
++    /// Transport to serve MCP over
++    #[arg(long, value_name = "TRANSPORT", value_enum, default_value_t = McpTransport::Stdio)]
++    pub transport: McpTransport,
++
++    /// Host or interface to bind when `--transport http`
++    #[arg(long, value_name = "HOST", default_value = "127.0.0.1")]
++    pub host: String,
++
++    /// Port to bind when `--transport http`
++    #[arg(long, value_name = "PORT", default_value_t = 8080)]
++    pub port: u16,
+ }
+ 
+ #[derive(Debug, Clone, Subcommand)]
+diff --git a/src/main.rs b/src/main.rs
+index 1f0b626..015ff94 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -47,10 +47,10 @@ use crate::cli::{
+     AssistantSubcommand, AssistantThreadExportFormat, AssistantThreadSubcommand, AuthSetArgs,
+     AuthSubcommand, BangSubcommand, Cli, Commands, CompletionCommand, CompletionInstallArgs,
+     CompletionShell, CompletionSubcommand, CustomBangSubcommand, EnrichSubcommand,
+-    ErrorOutputFormat, ExtractOutputFormat, HistorySubcommand, McpArgs, NewsFilterMode,
+-    NewsFilterScope, NotifyArgs, OutputFormat, QuickOutputFormat, SearchArgs, SearchOrder,
+-    SearchTime, SitePrefMode, SitePrefSubcommand, SkillsCommand, SkillsSubcommand, TranslateArgs,
+-    UsageOutputFormat, WatchArgs,
++    ErrorOutputFormat, ExtractOutputFormat, HistorySubcommand, McpArgs, McpTransport,
++    NewsFilterMode, NewsFilterScope, NotifyArgs, OutputFormat, QuickOutputFormat, SearchArgs,
++    SearchOrder, SearchTime, SitePrefMode, SitePrefSubcommand, SkillsCommand, SkillsSubcommand,
++    TranslateArgs, UsageOutputFormat, WatchArgs,
+ };
+ use crate::error::KagiError;
+ use crate::quick::{execute_quick, format_quick_markdown, format_quick_pretty};
+@@ -3242,6 +3242,14 @@ impl McpServerConfig {
+ async fn run_mcp(args: McpArgs, profile: Option<&str>) -> Result<(), KagiError> {
+     let _json_lines = args.json_lines;
+     let config = McpServerConfig::new(args.default_output, args.enable_mutating_tools);
++    match args.transport {
++        McpTransport::Stdio => run_mcp_stdio(profile, config).await,
++        McpTransport::Http => run_mcp_http(&args.host, args.port, profile, config).await,
++    }
++}
++
++/// Serve MCP JSON-RPC over stdin/stdout, one request per line.
++async fn run_mcp_stdio(profile: Option<&str>, config: McpServerConfig) -> Result<(), KagiError> {
+     let stdin = io::stdin();
+     for line in stdin.lock().lines() {
+         let line =
+@@ -3257,68 +3265,172 @@ async fn run_mcp(args: McpArgs, profile: Option<&str>) -> Result<(), KagiError>
+                 continue;
+             }
+         };
+-        // Notifications have no `id` field; per JSON-RPC 2.0 they must not be answered.
+-        let Some(id) = request.get("id").cloned() else {
+-            continue;
+-        };
+-
+-        let Some(method) = request.get("method").and_then(Value::as_str) else {
+-            let response = json_rpc_error(id, -32600, "Invalid Request: method is required".into());
++        if let Some(response) = mcp_handle_request(&request, profile, &config).await {
+             println!("{}", serde_json::to_string(&response)?);
+-            continue;
+-        };
++        }
++    }
++    Ok(())
++}
+ 
+-        // The server auto-negotiates per request: draft `2026-07-28` requests carry
+-        // the draft protocol version in `params._meta`, while stable-spec requests
+-        // (including `initialize`) do not. The stable spec also permits `_meta`
+-        // (e.g. `progressToken`), so discriminate on the namespaced draft key.
+-        let speaks_draft = request_speaks_draft(&request);
+-        let draft_validation = if speaks_draft {
+-            validate_mcp_request(&request)
+-        } else {
+-            Ok(())
+-        };
++/// Serve MCP over the Streamable HTTP transport. Each POST body carries either a
++/// single JSON-RPC message or a batch; requests return JSON, while
++/// notifications return an empty `202 Accepted`.
++async fn run_mcp_http(
++    host: &str,
++    port: u16,
++    profile: Option<&str>,
++    config: McpServerConfig,
++) -> Result<(), KagiError> {
++    let state = Arc::new(McpHttpState {
++        config: Arc::new(config),
++        profile: profile.map(str::to_string),
++    });
++    let app = mcp_http_router(state);
++    let address = format!("{host}:{port}");
++    let listener = tokio::net::TcpListener::bind(&address)
++        .await
++        .map_err(|error| KagiError::Config(format!("failed to bind {address}: {error}")))?;
++    eprintln!("kagi MCP server listening over http on {address}");
++    axum::serve(listener, app)
++        .await
++        .map_err(|error| KagiError::Config(format!("MCP http server failed: {error}")))
++}
+ 
+-        let response = match draft_validation {
+-            Ok(()) => match method {
+-                "initialize" => serde_json::json!({
+-                    "jsonrpc": "2.0",
+-                    "id": id,
+-                    "result": mcp_stable_initialize_result(&request),
+-                }),
+-                "ping" => serde_json::json!({
+-                    "jsonrpc": "2.0",
+-                    "id": id,
+-                    "result": {},
+-                }),
+-                "server/discover" if speaks_draft => serde_json::json!({
+-                    "jsonrpc": "2.0",
+-                    "id": id,
+-                    "result": mcp_discover_result(),
+-                }),
+-                "tools/list" if speaks_draft => match mcp_tools_list_result(&request, &config) {
+-                    Ok(result) => serde_json::json!({
+-                        "jsonrpc": "2.0",
+-                        "id": id,
+-                        "result": result,
+-                    }),
+-                    Err(error) => {
+-                        json_rpc_error_with_data(id, error.code, error.message, error.data)
+-                    }
+-                },
+-                "tools/list" => serde_json::json!({
++fn mcp_http_router(state: Arc<McpHttpState>) -> axum::Router {
++    axum::Router::new()
++        .fallback(mcp_http_handler)
++        .with_state(state)
++}
++
++struct McpHttpState {
++    config: Arc<McpServerConfig>,
++    profile: Option<String>,
++}
++
++async fn mcp_http_handler(
++    axum::extract::State(state): axum::extract::State<Arc<McpHttpState>>,
++    method: axum::http::Method,
++    body: String,
++) -> axum::response::Response {
++    use axum::response::IntoResponse;
++
++    if method != axum::http::Method::POST {
++        return axum::http::StatusCode::METHOD_NOT_ALLOWED.into_response();
++    }
++
++    let payload: Value = match serde_json::from_str(&body) {
++        Ok(payload) => payload,
++        Err(error) => {
++            return (
++                axum::http::StatusCode::BAD_REQUEST,
++                axum::Json(json_rpc_error(
++                    Value::Null,
++                    -32700,
++                    format!("Parse error: {error}"),
++                )),
++            )
++                .into_response();
++        }
++    };
++
++    match payload {
++        Value::Array(requests) => {
++            let mut responses = Vec::with_capacity(requests.len());
++            for request in &requests {
++                if let Some(response) =
++                    mcp_handle_request(request, state.profile.as_deref(), &state.config).await
++                {
++                    responses.push(response);
++                }
++            }
++            if responses.is_empty() {
++                axum::http::StatusCode::ACCEPTED.into_response()
++            } else {
++                axum::Json(Value::Array(responses)).into_response()
++            }
++        }
++        request @ Value::Object(_) => {
++            match mcp_handle_request(&request, state.profile.as_deref(), &state.config).await {
++                Some(response) => axum::Json(response).into_response(),
++                None => axum::http::StatusCode::ACCEPTED.into_response(),
++            }
++        }
++        _ => (
++            axum::http::StatusCode::BAD_REQUEST,
++            axum::Json(json_rpc_error(
++                Value::Null,
++                -32600,
++                "Invalid Request: expected a JSON-RPC object".to_string(),
++            )),
++        )
++            .into_response(),
++    }
++}
++
++/// Handle one parsed JSON-RPC message. Returns `None` for notifications, which
++/// must not be answered, and `Some(response)` otherwise.
++async fn mcp_handle_request(
++    request: &Value,
++    profile: Option<&str>,
++    config: &McpServerConfig,
++) -> Option<Value> {
++    // Notifications have no `id` field; per JSON-RPC 2.0 they must not be answered.
++    let id = request.get("id").cloned()?;
++
++    let Some(method) = request.get("method").and_then(Value::as_str) else {
++        return Some(json_rpc_error(
++            id,
++            -32600,
++            "Invalid Request: method is required".into(),
++        ));
++    };
++
++    // The server auto-negotiates per request: draft `2026-07-28` requests carry
++    // the draft protocol version in `params._meta`, while stable-spec requests
++    // (including `initialize`) do not. The stable spec also permits `_meta`
++    // (e.g. `progressToken`), so discriminate on the namespaced draft key.
++    let speaks_draft = request_speaks_draft(request);
++    let draft_validation = if speaks_draft {
++        validate_mcp_request(request)
++    } else {
++        Ok(())
++    };
++
++    Some(match draft_validation {
++        Ok(()) => match method {
++            "initialize" => serde_json::json!({
++                "jsonrpc": "2.0",
++                "id": id,
++                "result": mcp_stable_initialize_result(request),
++            }),
++            "ping" => serde_json::json!({
++                "jsonrpc": "2.0",
++                "id": id,
++                "result": {},
++            }),
++            "server/discover" if speaks_draft => serde_json::json!({
++                "jsonrpc": "2.0",
++                "id": id,
++                "result": mcp_discover_result(),
++            }),
++            "tools/list" if speaks_draft => match mcp_tools_list_result(request, config) {
++                Ok(result) => serde_json::json!({
+                     "jsonrpc": "2.0",
+                     "id": id,
+-                    "result": mcp_stable_tools_list_result(&config),
++                    "result": result,
+                 }),
+-                "tools/call" => mcp_tools_call_response(id, &request, profile, &config).await,
+-                _ => json_rpc_error(id, -32601, format!("Method not found: {method}")),
++                Err(error) => json_rpc_error_with_data(id, error.code, error.message, error.data),
+             },
+-            Err(error) => json_rpc_error_with_data(id, error.code, error.message, error.data),
+-        };
+-        println!("{}", serde_json::to_string(&response)?);
+-    }
+-    Ok(())
++            "tools/list" => serde_json::json!({
++                "jsonrpc": "2.0",
++                "id": id,
++                "result": mcp_stable_tools_list_result(config),
++            }),
++            "tools/call" => mcp_tools_call_response(id, request, profile, config).await,
++            _ => json_rpc_error(id, -32601, format!("Method not found: {method}")),
++        },
++        Err(error) => json_rpc_error_with_data(id, error.code, error.message, error.data),
++    })
+ }
+ 
+ fn json_rpc_error(id: Value, code: i64, message: String) -> Value {
